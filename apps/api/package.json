@@ -1,0 +1,16 @@
+{
+  "name": "@qa/api",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "python -m uvicorn app.main:app --reload --port 8000",
+    "start": "python -m uvicorn app.main:app --port 8000",
+    "lint": "ruff check .",
+    "typecheck": "mypy app",
+    "test": "pytest -q",
+    "clean": "rimraf .pytest_cache .mypy_cache .ruff_cache .turbo"
+  },
+  "devDependencies": {
+    "rimraf": "^6.0.1"
+  }
+}

@@ -1,0 +1,56 @@
+[project]
+name = "qa-api"
+version = "0.0.0"
+description = "QAtestbuddy backend (FastAPI)"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.5",
+  "uvicorn[standard]>=0.32.0",
+  "pydantic>=2.9.2",
+  "pydantic-settings>=2.6.1",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "asyncpg>=0.30.0",
+  "alembic>=1.14.0",
+  "httpx>=0.27.2",
+  "python-jose[cryptography]>=3.3.0",
+  "passlib[bcrypt]>=1.7.4",
+  "pgvector>=0.3.6",
+  "tenacity>=9.0.0",
+  "structlog>=24.4.0",
+  "cryptography>=43.0.3",
+  "sse-starlette>=2.1.3",
+  "python-multipart>=0.0.17",
+  "pypdf>=5.1.0",
+  "python-docx>=1.1.2",
+  "markdown-it-py>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+  "pytest-asyncio>=0.24.0",
+  "httpx>=0.27.2",
+  "ruff>=0.7.4",
+  "mypy>=1.13.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Tell setuptools to look at the `app` package only — node_modules/ sits next
+# to it because Turborepo runs `pnpm install` for every workspace.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["node_modules*", ".venv*", "tests*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

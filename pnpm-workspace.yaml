@@ -1,0 +1,10 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm 11 requires explicit opt-in for postinstall build scripts.
+# All three build native binaries that are required at runtime.
+allowBuilds:
+  esbuild: true
+  sharp: true
+  unrs-resolver: true

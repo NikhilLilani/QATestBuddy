@@ -1,0 +1,17 @@
+# Local dev services. Bring up with:
+#   docker compose -f infra/docker-compose.dev.yml up -d
+#
+# Services:
+#   mailpit  - SMTP catcher for OTP / password-reset emails (web UI on :8025)
+services:
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: qatb-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI -> http://localhost:8025
+    environment:
+      MP_MAX_MESSAGES: "5000"
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
