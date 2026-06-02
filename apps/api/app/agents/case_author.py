@@ -10,9 +10,14 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from app.agents.base import AgentEnvelope, JiraCitation
+from app.agents.base import AgentEnvelope, JiraCitation, RagCitation, RepoCitation
 from app.agents.planner import PlanContent
 from app.services.llm import LLMClient
+from app.services.rag_retrieve import format_for_prompt, retrieve
+from app.services.repo_retrieve import (
+    format_for_prompt as format_code_for_prompt,
+    retrieve_code,
+)
 
 
 # Allowed values we *prefer*, but we accept any string and normalize unknowns.
@@ -231,11 +236,28 @@ about UI labels, the flow order, or what success looks like. A good
 clarification beats a hallucinated case."""
 
 
-def _user_prompt(ticket: dict[str, Any], plan: PlanContent | None) -> str:
-    parts = [
-        f"Jira ticket {ticket['key']}: {ticket.get('title')}",
-        f"Description:\n{ticket.get('description') or '(none)'}",
-    ]
+def _user_prompt(
+    ticket: dict[str, Any],
+    plan: PlanContent | None,
+    rag_block: str = "",
+    code_block: str = "",
+) -> str:
+    # M5: ticket may be a "virtual" object built from a free-text flow (no
+    # Jira). We detect that by the `key` prefix `_flow_` so the prompt can
+    # frame the source honestly to the model (otherwise it tries to cite
+    # Jira fields that don't exist).
+    is_virtual = str(ticket.get("key", "")).startswith("_flow_")
+    if is_virtual:
+        parts = [
+            "User-supplied test flow (NO Jira ticket — this prose IS the requirement):",
+            f"Title: {ticket.get('title') or '(untitled)'}",
+            f"Flow description:\n{ticket.get('description') or '(none)'}",
+        ]
+    else:
+        parts = [
+            f"Jira ticket {ticket['key']}: {ticket.get('title')}",
+            f"Description:\n{ticket.get('description') or '(none)'}",
+        ]
     attachments = ticket.get("attachments") or []
     if attachments:
         att_lines = []
@@ -266,6 +288,35 @@ def _user_prompt(ticket: dict[str, Any], plan: PlanContent | None) -> str:
             "from the ticket description above. If important context is missing, "
             "add a question to `clarifications` instead of inventing."
         )
+
+    # Grounded retrieval: passages pulled from the workspace's knowledge sources
+    # (PRD/BRD uploads, Confluence pages, Google Docs). Treated as authoritative
+    # about the system under test. Each block is tagged with its chunk_id so the
+    # model could later cite it — wired through end-to-end in M4 (clarify loop).
+    if rag_block:
+        parts.append("")
+        parts.append(
+            "Reference passages from this workspace's knowledge base. Treat these "
+            "as authoritative about the system under test. If a passage contradicts "
+            "the ticket, prefer the passage and add a clarification noting the "
+            "conflict — do not silently pick one side."
+        )
+        parts.append(rag_block)
+
+    # Dev-repo code snippets — the source of truth for what actually exists in
+    # the app. Component names, data-testids, route paths, form schemas. The
+    # model should ground concrete UI references (button labels, selectors)
+    # in these blocks instead of inventing them.
+    if code_block:
+        parts.append("")
+        parts.append(
+            "Excerpts from the application's source code. Treat these as the "
+            "single source of truth for what UI elements, routes, and APIs "
+            "actually exist. If you mention a selector, route, or component, "
+            "it must appear in one of these excerpts. If you can't find it, "
+            "add a clarification rather than invent."
+        )
+        parts.append(code_block)
     return "\n".join(parts)
 
 
@@ -275,10 +326,41 @@ async def generate_cases(
     plan: PlanContent | None = None,
 ) -> AgentEnvelope[list[TestCase]]:
     llm = await LLMClient.from_workspace(workspace_id)
+
+    # M1/M2: pull grounding passages from the workspace's knowledge base and
+    # any indexed dev repos. Both lookups are opportunistic — if either is
+    # empty or fails (e.g. embedding model not yet downloaded on first run)
+    # we still generate cases from the ticket alone.
+    import logging
+    _log = logging.getLogger("qatb.case_author")
+
+    query = " ".join(
+        filter(None, [ticket.get("title"), ticket.get("key"), (ticket.get("description") or "")[:400]])
+    )
+
+    rag_block = ""
+    rag_chunks_used: list = []
+    try:
+        rag_chunks_used = await retrieve(workspace_id=workspace_id, query=query, k=8)
+        rag_block = format_for_prompt(rag_chunks_used, max_chars=6000)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("RAG retrieval skipped: %s", e)
+
+    code_block = ""
+    code_chunks_used: list = []
+    try:
+        code_chunks_used = await retrieve_code(workspace_id=workspace_id, query=query, k=6)
+        code_block = format_code_for_prompt(code_chunks_used, max_chars=5000)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("Dev-repo retrieval skipped: %s", e)
+
     # Bigger budget for 15-20 cases (each ~200-400 tokens). temperature=0
     # makes the count and structure more consistent across runs.
     result = await llm.complete_json(
-        SYSTEM, _user_prompt(ticket, plan), max_tokens=12000, temperature=0.0
+        SYSTEM,
+        _user_prompt(ticket, plan, rag_block, code_block),
+        max_tokens=12000,
+        temperature=0.0,
     )
 
     if not result.parsed or not isinstance(result.parsed, dict):
@@ -316,10 +398,26 @@ async def generate_cases(
     parsed = CasesResult.model_construct(cases=good_cases, clarifications=parsed_clarifications)
 
     confidence = max(0.0, 1.0 - 0.10 * len(parsed.clarifications))
-    citations = [
+    citations: list = [
         JiraCitation(key=ticket["key"], field="description"),
         JiraCitation(key=ticket["key"], field="summary"),
     ]
+    # Surface every chunk we showed the model so the UI can render "evidence"
+    # pills next to the generated cases. The model itself doesn't need to
+    # decide which chunks to cite at this stage — that's M4's job. Listing
+    # the candidates here keeps the audit trail honest in the meantime.
+    for c in rag_chunks_used[:5]:
+        citations.append(RagCitation(chunk_id=c.chunk_id))
+    # Same for dev-repo code excerpts — emit a RepoCitation per chunk shown
+    # to the model. line_start/line_end are 1/1 placeholders until the
+    # chunker tracks original offsets (TODO for M3's locator pass).
+    for c in code_chunks_used[:5]:
+        citations.append(RepoCitation(
+            repo=c.repo_name,
+            path=c.path,
+            line_start=1,
+            line_end=1,
+        ))
 
     return AgentEnvelope[list[TestCase]](
         data=parsed.cases,

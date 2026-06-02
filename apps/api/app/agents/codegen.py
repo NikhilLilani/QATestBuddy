@@ -29,6 +29,25 @@ class CodegenInput(BaseModel):
     test_file_name: str = Field(default="generated.spec.ts")
     framework_context: str = ""
     local_path: str = ""
+    # M4: pre-resolved selectors and routes from the dev repo. Empty when no
+    # dev repo is indexed; non-empty blocks invented selectors via the
+    # codegen prompt (see SYSTEM).
+    grounded_block: str = ""
+    # M5: branch the system prompt by project state.
+    #   new_project       — full skeleton
+    #   existing_no_tests — add tests into an existing project, merge config
+    #   existing_same_fw  — extend the existing Playwright framework
+    #   existing_diff_fw  — migrate from another framework into Playwright
+    project_state: Literal[
+        "new_project", "existing_no_tests", "existing_same_fw", "existing_diff_fw"
+    ] = "new_project"
+    # M5: only used when project_state == existing_diff_fw.
+    #   migrate   — generate Playwright in parallel folder
+    #   keep_both — same as migrate + emit MIGRATION.md mapping old→new
+    migration_mode: Literal["migrate", "keep_both"] = "migrate"
+    # M5: per-case override prompts (case ord/id → user delta-prompt). Folded
+    # into each case's prompt block so the LLM applies them locally.
+    case_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 class GeneratedFile(BaseModel):
@@ -197,10 +216,22 @@ def _user_prompt(ticket: dict[str, Any], cases: list[TestCase], inp: CodegenInpu
             "complete project skeleton including package.json, playwright.config.ts, "
             "tsconfig.json, fixtures, POMs, the new spec, and README.md.)"
         )
+    if inp.grounded_block.strip():
+        parts.append("")
+        parts.append(inp.grounded_block.strip())
+
+    # M5: tell the model what *kind* of output we expect. Each branch has a
+    # different "do/don't" list — keeping these out of SYSTEM means we don't
+    # ship the full instruction set when the user is just adding one spec.
+    parts.append("")
+    parts.append(_project_state_directive(inp))
+
     parts.append("")
     parts.append(f"Suggested spec file name: {inp.test_file_name}")
     parts.append("")
     parts.append("Test cases to translate (JSON):")
+    # M5: per-case overrides are attached on the case dict so the model sees
+    # them next to the case body. Keyed by ord (str) — matches CodegenRequest.
     parts.append(
         json.dumps(
             [
@@ -213,13 +244,97 @@ def _user_prompt(ticket: dict[str, Any], cases: list[TestCase], inp: CodegenInpu
                     "steps": [s.model_dump() for s in c.steps],
                     "data": c.data,
                     "tags": c.tags,
+                    # Only emit the key when an override is present; keeps
+                    # the JSON tight for the common no-override path.
+                    **(
+                        {"override_prompt": inp.case_overrides[str(i)]}
+                        if str(i) in inp.case_overrides
+                        else {}
+                    ),
                 }
                 for i, c in enumerate(cases)
             ],
             indent=2,
         )
     )
+    if inp.case_overrides:
+        parts.append("")
+        parts.append(
+            "When a case has an `override_prompt` field, apply that instruction "
+            "ONLY to that case — it's the user's delta on top of the case body. "
+            "Do not let one case's override leak into another's generated code."
+        )
     return "\n".join(parts)
+
+
+def _project_state_directive(inp: CodegenInput) -> str:
+    """Return the right 'what to emit' instructions for the project state."""
+    if inp.project_state == "new_project":
+        return (
+            "=== PROJECT STATE: new_project ===\n"
+            "Emit a COMPLETE runnable Playwright project skeleton. Every file is "
+            "operation=create. Required files at minimum:\n"
+            "  - package.json (with @playwright/test + dotenv)\n"
+            "  - playwright.config.ts (browsers, retries, html reporter)\n"
+            "  - tsconfig.json\n"
+            "  - .env.example with every process.env.* the tests reference\n"
+            "  - .gitignore (node_modules, .env, playwright-report, test-results)\n"
+            "  - README.md with install + run instructions\n"
+            "  - src/fixtures/index.ts (test fixtures)\n"
+            "  - src/pages/* (page objects for every screen referenced)\n"
+            "  - src/tests/*.spec.ts (one per feature)\n"
+            "  - .github/workflows/playwright.yml (CI ready)"
+        )
+    if inp.project_state == "existing_no_tests":
+        return (
+            "=== PROJECT STATE: existing_no_tests ===\n"
+            "The user has a project but no test framework yet. ADD Playwright "
+            "alongside their code without disturbing it. Rules:\n"
+            "  - package.json: operation=merge — only add the new @playwright/test "
+            "    + dotenv deps. Do NOT replace the user's scripts, deps, or version.\n"
+            "  - tsconfig.json: operation=merge IF one exists, else create. Never "
+            "    overwrite the user's compilerOptions.\n"
+            "  - playwright.config.ts: operation=create — place at repo root.\n"
+            "  - All test files under tests/ (or e2e/ if that folder already exists).\n"
+            "  - Do not emit a .gitignore (the user has one)."
+        )
+    if inp.project_state == "existing_same_fw":
+        return (
+            "=== PROJECT STATE: existing_same_fw ===\n"
+            "A Playwright framework already exists in the dev repo. EXTEND it; "
+            "do NOT recreate scaffolding. Hard rules:\n"
+            "  - NEVER emit package.json, tsconfig.json, playwright.config.ts.\n"
+            "  - Reuse existing fixtures, page objects, helpers from the framework "
+            "    context block above — operation=update when extending them.\n"
+            "  - New specs: operation=create under the framework's existing tests/ "
+            "    directory, following the same naming convention as the samples.\n"
+            "  - If a similar spec already exists in the framework context, "
+            "    operation=update on THAT file and ADD test() blocks rather than "
+            "    creating a duplicate file."
+        )
+    # existing_diff_fw
+    keep_both = inp.migration_mode == "keep_both"
+    return (
+        "=== PROJECT STATE: existing_diff_fw ===\n"
+        f"Migration mode: {inp.migration_mode}.\n"
+        "The dev repo uses a different test framework. Translate the cases into "
+        "Playwright in a PARALLEL folder so the user's existing tests are not "
+        "touched. Rules:\n"
+        "  - Place all generated files under tests-playwright/ at the repo root.\n"
+        "  - operation=create for everything (the folder is new).\n"
+        "  - Include playwright.config.ts + minimal package.json IF the project's "
+        "    package.json doesn't already include @playwright/test.\n"
+        "  - Reuse selectors that already appear in the other framework's tests "
+        "    (they're in the framework_context above) — those selectors are PROVEN "
+        "    against the live app, do not invent variants.\n"
+        + (
+            "  - ALSO emit MIGRATION.md at the repo root: a markdown table mapping "
+            "each old test file → its Playwright equivalent, with a one-line note "
+            "on parity (full / partial / skipped + reason)."
+            if keep_both else
+            "  - Do NOT emit MIGRATION.md; user picked migrate-only."
+        )
+    )
 
 
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$", re.MULTILINE)

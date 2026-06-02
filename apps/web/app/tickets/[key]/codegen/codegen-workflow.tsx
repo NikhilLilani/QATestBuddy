@@ -109,6 +109,33 @@ type DataNeed = {
   codegen_hint?: string;
 };
 
+// M4 — clarify question emitted by the backend's grounding pass. Same shape
+// for pre-flight ("can't find this selector") and post-flight ("this looks
+// invented, confirm it's real").
+type ClarifyQuestion = {
+  id: string;
+  label: string;
+  reason: string;
+  kind: 'selector' | 'route' | 'free';
+  intent: string;
+  placeholder?: string;
+  suggested?: string[];
+};
+
+type ClarifyPayload = {
+  stage: 'preflight' | 'postflight';
+  questions: ClarifyQuestion[];
+  resolved?: Array<{
+    intent: string;
+    kind: 'locator' | 'route';
+    value: string;
+    selector_kind?: string | null;
+    source_file?: string | null;
+    source_line?: number | null;
+  }>;
+  flags?: Array<{ kind: string; value: string; file: string; line: number; reason: string }>;
+};
+
 export function CodegenWorkflow({
   ticketKey,
   frameworks,
@@ -140,6 +167,16 @@ export function CodegenWorkflow({
   const [codegen, setCodegen] = useState<CodegenResult | null>(null);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // M4 clarify state. When non-null the user is mid-answer; submitting will
+  // re-POST codegen with `clarifications` filled in (same plan, same body).
+  const [clarify, setClarify] = useState<ClarifyPayload | null>(null);
+  const [clarifyAnswers, setClarifyAnswers] = useState<Record<string, string>>({});
+  // Carried across clarify rounds so re-submissions accumulate user answers
+  // instead of forgetting previous ones (the backend keys on question id, so
+  // older answers stay valid as long as the same questions resurface).
+  const [accumulatedClarifications, setAccumulatedClarifications] = useState<
+    Record<string, string>
+  >({});
   // Stale job from URL (?job=...) — user can dismiss the panel; we also
   // auto-dismiss as soon as a new codegen starts so the old run doesn't
   // hog the top of the page.
@@ -250,11 +287,18 @@ export function CodegenWorkflow({
     return true;
   }, [dataNeeds, dataValues]);
 
+  // Carries the plan_id across clarify resubmissions so we can re-POST
+  // /plans/{planId}/codegen without re-running cases generation each time.
+  const [activePlanId, setActivePlanId] = useState<string>('');
+
   const findOrCreatePlanThenCodegen = useCallback(async () => {
     setGenerating(true);
     setError(null);
     setCodegen(null);
     setSteps([]);
+    setClarify(null);
+    setClarifyAnswers({});
+    setAccumulatedClarifications({});
     // The user is starting a new generation — hide the stale ?job=... panel
     // so the new BundleViewer can take the spotlight.
     setStalePanelJobId(null);
@@ -309,41 +353,8 @@ export function CodegenWorkflow({
       }
 
       if (!planId) throw new Error('No plan returned from cases generation.');
-
-      // Now codegen
-      const codegenResp = await fetch(`${API_URL}/api/v1/plans/${planId}/codegen`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-Workspace-Id': workspaceId,
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        body: JSON.stringify({
-          base_url: baseUrl.trim(),
-          framework_id: frameworkId,
-          framework_hints: flowGuidance.trim(),
-          local_path: localPath.trim(),
-          test_file_name: `${ticketKey.toLowerCase()}.spec.ts`,
-          data_values: dataValues,
-          data_needs: dataNeeds ?? [],
-        }),
-      });
-      if (!codegenResp.ok || !codegenResp.body)
-        throw new Error(`Codegen failed (HTTP ${codegenResp.status}).`);
-
-      for await (const ev of parseSSE(codegenResp.body)) {
-        if (ev.event === 'step') {
-          setSteps((prev) => [...prev, JSON.parse(ev.data) as StepEvent]);
-        } else if (ev.event === 'result') {
-          setCodegen(JSON.parse(ev.data) as CodegenResult);
-        } else if (ev.event === 'error') {
-          const e = JSON.parse(ev.data) as { message: string };
-          throw new Error(e.message);
-        } else if (ev.event === 'done') {
-          break;
-        }
-      }
+      setActivePlanId(planId);
+      await runCodegenSSE(workspaceId, token, planId, {});
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
@@ -352,6 +363,116 @@ export function CodegenWorkflow({
       setGenerating(false);
     }
   }, [baseUrl, flowGuidance, frameworkId, localPath, ticketKey, dataValues, dataNeeds]);
+
+  // Single SSE consumer for /plans/{id}/codegen. Used both on initial run and
+  // on every clarify-loop resume. Handles all 4 event kinds: step, clarify
+  // (M4 — halts the stream so user can answer), result, error.
+  async function runCodegenSSE(
+    workspaceId: string,
+    token: string,
+    planId: string,
+    extraClarifications: Record<string, string>,
+  ): Promise<void> {
+    // Merge accumulated answers from prior rounds with new ones so an answer
+    // given in round 1 isn't lost if round 2 surfaces a different question.
+    const merged = { ...accumulatedClarifications, ...extraClarifications };
+    setAccumulatedClarifications(merged);
+
+    const codegenResp = await fetch(`${API_URL}/api/v1/plans/${planId}/codegen`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Workspace-Id': workspaceId,
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        base_url: baseUrl.trim(),
+        framework_id: frameworkId,
+        framework_hints: flowGuidance.trim(),
+        local_path: localPath.trim(),
+        test_file_name: `${ticketKey.toLowerCase()}.spec.ts`,
+        data_values: dataValues,
+        data_needs: dataNeeds ?? [],
+        clarifications: merged,
+      }),
+    });
+    if (!codegenResp.ok || !codegenResp.body)
+      throw new Error(`Codegen failed (HTTP ${codegenResp.status}).`);
+
+    for await (const ev of parseSSE(codegenResp.body)) {
+      if (ev.event === 'step') {
+        setSteps((prev) => [...prev, JSON.parse(ev.data) as StepEvent]);
+      } else if (ev.event === 'clarify') {
+        const payload = JSON.parse(ev.data) as ClarifyPayload;
+        setClarify(payload);
+        // Pre-seed the answer form with the top suggestion if there's an
+        // obvious "best guess" — easier to confirm than to type from scratch.
+        const seeds: Record<string, string> = {};
+        for (const q of payload.questions) {
+          if (q.suggested && q.suggested.length > 0) {
+            // Suggested string format: "kind=value (path:line)" — strip the
+            // file location for the field default; user can edit if needed.
+            const first = (q.suggested[0] ?? '').split(' (')[0] ?? '';
+            seeds[q.id] = first;
+          }
+        }
+        setClarifyAnswers((prev) => ({ ...seeds, ...prev }));
+        toast.info(
+          payload.stage === 'preflight'
+            ? `Need ${payload.questions.length} answer${payload.questions.length !== 1 ? 's' : ''} before generating.`
+            : `Found ${payload.questions.length} possibly-invented reference${payload.questions.length !== 1 ? 's' : ''} — please confirm.`,
+        );
+      } else if (ev.event === 'result') {
+        setCodegen(JSON.parse(ev.data) as CodegenResult);
+        setClarify(null);
+        setClarifyAnswers({});
+      } else if (ev.event === 'error') {
+        const e = JSON.parse(ev.data) as { message: string };
+        throw new Error(e.message);
+      } else if (ev.event === 'done') {
+        break;
+      }
+    }
+  }
+
+  const submitClarify = useCallback(async () => {
+    if (!clarify || !activePlanId) return;
+    // Every required question must have a non-empty answer. (All clarify
+    // questions are effectively required — the backend wouldn't have raised
+    // them otherwise.) Allow "ok" / "yes" as accept-as-is shortcuts.
+    const missing = clarify.questions.filter(
+      (q) => !(clarifyAnswers[q.id] ?? '').trim(),
+    );
+    if (missing.length > 0) {
+      toast.error(`Please answer ${missing.length} remaining question${missing.length !== 1 ? 's' : ''}.`);
+      return;
+    }
+    setGenerating(true);
+    setError(null);
+    setSteps([]);
+    try {
+      const token = await getAccessToken();
+      if (!token) throw new Error('Not authenticated.');
+      const wsResp = await fetch(`${API_URL}/api/v1/workspaces`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const wsList = (await wsResp.json()) as { id: string }[];
+      const workspaceId = wsList[0]?.id;
+      if (!workspaceId) throw new Error('No workspace.');
+      await runCodegenSSE(workspaceId, token, activePlanId, clarifyAnswers);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setGenerating(false);
+    }
+    // runCodegenSSE captures component state via closure, so we don't need it
+    // in deps; including it would trigger needless re-creations of the
+    // callback on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clarify, clarifyAnswers, activePlanId]);
 
   const canGenerate =
     !!frameworkId &&
@@ -776,6 +897,16 @@ Examples:
 
           {error && <Alert variant="error">{error}</Alert>}
 
+          {clarify && (
+            <ClarifyPanel
+              payload={clarify}
+              answers={clarifyAnswers}
+              onChange={setClarifyAnswers}
+              onSubmit={submitClarify}
+              submitting={generating}
+            />
+          )}
+
           {codegen && (
             <BundleViewer
               codegen={codegen}
@@ -786,6 +917,97 @@ Examples:
           )}
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+/* ============================== ClarifyPanel ==============================
+ *
+ * Surfaces the blocking clarify questions emitted by the M4 grounding pass.
+ * The whole component is intentionally simple: a list of (label, reason,
+ * input, suggested) rows + one submit button that re-POSTs codegen with the
+ * answers as `clarifications`.
+ */
+function ClarifyPanel({
+  payload,
+  answers,
+  onChange,
+  onSubmit,
+  submitting,
+}: {
+  payload: ClarifyPayload;
+  answers: Record<string, string>;
+  onChange: (next: Record<string, string>) => void;
+  onSubmit: () => void;
+  submitting: boolean;
+}) {
+  const setVal = (id: string, v: string) => onChange({ ...answers, [id]: v });
+
+  const isPre = payload.stage === 'preflight';
+  return (
+    <div className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <div className="font-semibold">
+            {isPre
+              ? '🛑 Clarify before generating'
+              : '🛑 Verify the generated references'}
+          </div>
+          <p className="mt-0.5 text-xs">
+            {isPre
+              ? `I couldn't ground ${payload.questions.length} reference${payload.questions.length !== 1 ? 's' : ''} in your dev repo. Answer below and I'll continue.`
+              : `The model produced ${payload.questions.length} reference${payload.questions.length !== 1 ? 's' : ''} that don't appear in your dev repo. Confirm or correct each.`}
+          </p>
+        </div>
+        {payload.resolved && payload.resolved.length > 0 && (
+          <span className="rounded bg-emerald-100 px-2 py-0.5 text-[11px] text-emerald-800">
+            ✓ {payload.resolved.length} already resolved
+          </span>
+        )}
+      </div>
+
+      <div className="mt-3 space-y-3">
+        {payload.questions.map((q) => {
+          const value = answers[q.id] ?? '';
+          return (
+            <div key={q.id} className="rounded border border-amber-200 bg-white p-3">
+              <Label htmlFor={`cl-${q.id}`} className="text-amber-900">
+                {q.label}
+              </Label>
+              <p className="mt-0.5 text-[11px] text-amber-800">{q.reason}</p>
+              <Input
+                id={`cl-${q.id}`}
+                className="mt-2"
+                value={value}
+                onChange={(e) => setVal(q.id, e.target.value)}
+                placeholder={q.placeholder ?? ''}
+              />
+              {q.suggested && q.suggested.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <span className="text-[10px] text-amber-700">Nearest matches:</span>
+                  {q.suggested.map((s, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      onClick={() => setVal(q.id, s.split(' (')[0] ?? '')}
+                      className="rounded border border-amber-300 bg-amber-100 px-1.5 py-0.5 font-mono text-[10px] hover:bg-amber-200"
+                      title="Click to use this suggestion"
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-3 flex justify-end">
+        <Button onClick={onSubmit} loading={submitting} loadingText="Resuming…">
+          Continue with these answers
+        </Button>
+      </div>
     </div>
   );
 }

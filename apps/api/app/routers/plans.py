@@ -709,28 +709,85 @@ async def create_cases(plan_id: str, ws: CurrentWorkspace) -> StreamingResponse:
 
 
 class DirectCasesRequest(BaseModel):
-    ticket_key: str
+    # M5: either ticket_key XOR flow_text must be provided. flow_text is
+    # the "no Jira, just describe the flow" entry point for Flow 2.
+    ticket_key: str = ""
+    flow_text: str = ""
+    flow_title: str = ""
 
 
 @router.post("/cases")
 async def create_cases_direct(body: DirectCasesRequest, ws: CurrentWorkspace) -> StreamingResponse:
-    """Generate test cases from a Jira ticket without a separately-authored plan.
+    """Generate test cases from a Jira ticket OR from a free-text flow.
 
     Creates a stub plan record so cases still have a parent (plan_id is NOT
-    NULL in the schema) but marks it as auto-generated.
+    NULL in the schema). When using flow_text, also creates a synthetic
+    `tickets` row with jira_key = '_flow_<hash>' so the schema is satisfied.
     """
     workspace_id = ws.workspace_id
     user_id = ws.user_id
-    ticket_key = body.ticket_key.upper()
+    ticket_key = body.ticket_key.upper() if body.ticket_key else ""
+    flow_text = (body.flow_text or "").strip()
+
+    if not ticket_key and not flow_text:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Either ticket_key or flow_text must be provided.",
+        )
 
     async def stream() -> AsyncIterator[bytes]:
         try:
-            yield _sse_bytes("step", {"name": "fetch_ticket", "status": "start", "key": ticket_key})
-            ticket = await jira_svc.get_issue(workspace_id, ticket_key)
-            yield _sse_bytes(
-                "step",
-                {"name": "fetch_ticket", "status": "done", "title": ticket["title"]},
-            )
+            if ticket_key:
+                yield _sse_bytes(
+                    "step", {"name": "fetch_ticket", "status": "start", "key": ticket_key},
+                )
+                ticket = await jira_svc.get_issue(workspace_id, ticket_key)
+                yield _sse_bytes(
+                    "step",
+                    {"name": "fetch_ticket", "status": "done", "title": ticket["title"]},
+                )
+            else:
+                # Build a virtual ticket from the supplied flow. The key
+                # prefix `_flow_` is the signal case_author uses to switch
+                # its prompt framing (no Jira, no description field cite).
+                import hashlib
+                virt_key = "_flow_" + hashlib.sha256(flow_text.encode()).hexdigest()[:8]
+                ticket = {
+                    "key": virt_key,
+                    "title": (body.flow_title or "User-supplied flow")[:200],
+                    "description": flow_text,
+                    "status": "open",
+                    "priority": "P2",
+                    "issuetype": "Test",
+                    "attachments": [],
+                }
+                yield _sse_bytes(
+                    "step",
+                    {"name": "fetch_ticket", "status": "done",
+                     "title": ticket["title"], "source": "flow_text"},
+                )
+                # Persist the virtual ticket so plans.ticket_id has a parent.
+                # We dedupe by jira_key so re-submitting the same flow text
+                # within a workspace reuses the row instead of duplicating.
+                existing = await fetchrow(
+                    "select id::text from public.tickets "
+                    "where workspace_id = $1 and jira_key = $2",
+                    workspace_id, virt_key,
+                )
+                if not existing:
+                    await execute(
+                        """
+                        insert into public.tickets
+                          (workspace_id, jira_key, title, description, status, raw)
+                        values ($1, $2, $3, $4, 'open', $5::jsonb)
+                        on conflict (workspace_id, jira_key) do nothing
+                        """,
+                        workspace_id, virt_key, ticket["title"], ticket["description"],
+                        {"source": "flow_text", "fields": {}},
+                    )
+                # Use the synthetic key downstream so the rest of the stream
+                # treats this exactly like a Jira ticket.
+                ticket_key = virt_key
 
             yield _sse_bytes("step", {"name": "generate_cases", "status": "start"})
             envelope = await generate_cases(workspace_id, ticket, plan=None)
@@ -885,6 +942,20 @@ class CodegenRequest(BaseModel):
     # Automation triage — if provided, codegen runs ONLY for these case IDs.
     # Empty list = use all non-skipped cases (status != automation_candidate=no).
     case_ids: list[str] = Field(default_factory=list)
+    # M4: dev-repo selection for selector/route grounding. Optional.
+    # When set, find_locator/find_route are scoped to this repo only —
+    # multi-app workspaces don't bleed selectors across products.
+    dev_repo_id: str | None = None
+    # M4: user answers to a prior clarify SSE event. The key is the
+    # ClarifyQuestion.id; the value is whatever the user typed. The codegen
+    # request resumes with these answers folded into the grounded set.
+    clarifications: dict[str, str] = Field(default_factory=dict)
+    # M5: project state branching. If omitted we auto-detect via
+    # /project-state/detect (same heuristics). Pass a value to override.
+    project_state: str | None = None
+    migration_mode: str = "migrate"
+    # M5: per-case override prompts, keyed by case ord (as string).
+    case_overrides: dict[str, str] = Field(default_factory=dict)
 
 
 class DataNeedsRequest(BaseModel):
@@ -1045,16 +1116,102 @@ async def create_codegen(
         if data_hint:
             framework_hints = f"{framework_hints}\n{data_hint}".strip()
 
+    # M5: resolve project state. User override wins; otherwise auto-detect.
+    from app.services.project_state import detect_state as _detect_state
+    if body.project_state in ("new_project", "existing_no_tests",
+                              "existing_same_fw", "existing_diff_fw"):
+        resolved_state = body.project_state
+    else:
+        verdict = await _detect_state(
+            workspace_id=workspace_id,
+            framework_id=body.framework_id,
+            dev_repo_id=body.dev_repo_id,
+        )
+        resolved_state = verdict.state
+        log.info(
+            "codegen: auto-detected project_state=%s (confidence=%.2f, evidence=%s)",
+            resolved_state, verdict.confidence, "; ".join(verdict.evidence)[:200],
+        )
+
     inp = CodegenInput(
         base_url=body.base_url.strip(),
         framework_hints=framework_hints,
         test_file_name=body.test_file_name.strip() or "generated.spec.ts",
         framework_context=framework_context,
         local_path=body.local_path.strip(),
+        project_state=resolved_state,  # type: ignore[arg-type]
+        migration_mode=(
+            body.migration_mode if body.migration_mode in ("migrate", "keep_both") else "migrate"
+        ),  # type: ignore[arg-type]
+        case_overrides=body.case_overrides,
     )
 
     async def stream() -> AsyncIterator[bytes]:
         try:
+            # Stage 0 — pre-flight grounding (M4)
+            # If the workspace has an indexed dev repo, every UI intent in
+            # the cases must resolve to a real locator/route or the user has
+            # to clarify. Returns immediately with an empty grounded block
+            # when no dev repo is indexed.
+            from app.agents.grounding import postflight_scan, preflight_grounding
+            yield _sse_bytes("step", {"name": "grounding", "status": "start"})
+            preflight = await preflight_grounding(
+                workspace_id=workspace_id,
+                cases=cases,
+                dev_repo_id=body.dev_repo_id,
+                user_clarifications=body.clarifications,
+            )
+            yield _sse_bytes(
+                "step",
+                {
+                    "name": "grounding",
+                    "status": "done",
+                    "intents_total": preflight.intents_total,
+                    "intents_resolved": preflight.intents_resolved,
+                    "clarify_count": len(preflight.clarify),
+                },
+            )
+
+            # If anything is unresolved, halt and ask the user. The frontend
+            # collects the answers and re-POSTs with `clarifications` filled
+            # in; this same stream restarts from Stage 0 and the answered
+            # questions are now treated as canonical grounded refs.
+            if preflight.clarify:
+                yield _sse_bytes(
+                    "clarify",
+                    {
+                        "stage": "preflight",
+                        "questions": [
+                            {
+                                "id": q.id,
+                                "label": q.label,
+                                "reason": q.reason,
+                                "kind": q.kind,
+                                "intent": q.intent,
+                                "placeholder": q.placeholder,
+                                "suggested": q.suggested,
+                            }
+                            for q in preflight.clarify
+                        ],
+                        "resolved": [
+                            {
+                                "intent": g.intent,
+                                "kind": g.kind,
+                                "value": g.value,
+                                "selector_kind": g.selector_kind,
+                                "source_file": g.source_file,
+                                "source_line": g.source_line,
+                            }
+                            for g in preflight.grounded
+                        ],
+                    },
+                )
+                yield _sse_bytes("done", {})
+                return
+
+            # All intents resolved — inject the grounded block into the prompt.
+            inp.grounded_block = preflight.prompt_block
+
             # Stage 1 — codegen
             yield _sse_bytes(
                 "step",
@@ -1062,6 +1219,53 @@ async def create_codegen(
             )
             envelope = await generate_playwright_bundle(workspace_id, ticket, cases, inp)
             total_lines = sum(f.content.count("\n") + 1 for f in envelope.data.files)
+
+            # Stage 1.5 — post-flight scan (M4). Catches anything the model
+            # invented in spite of the grounded block. Only blocks when we
+            # have something to check against (i.e. an indexed dev repo).
+            postflight = await postflight_scan(
+                workspace_id=workspace_id,
+                files=envelope.data.files,
+                grounded_locator_values={
+                    g.value for g in preflight.grounded if g.kind == "locator"
+                },
+                grounded_route_values={
+                    g.value for g in preflight.grounded if g.kind == "route"
+                },
+                dev_repo_id=body.dev_repo_id,
+            )
+            if postflight.clarify:
+                yield _sse_bytes(
+                    "clarify",
+                    {
+                        "stage": "postflight",
+                        "questions": [
+                            {
+                                "id": q.id,
+                                "label": q.label,
+                                "reason": q.reason,
+                                "kind": q.kind,
+                                "intent": q.intent,
+                                "placeholder": q.placeholder,
+                                "suggested": q.suggested,
+                            }
+                            for q in postflight.clarify
+                        ],
+                        "flags": [
+                            {
+                                "kind": fl.kind,
+                                "value": fl.value,
+                                "file": fl.file,
+                                "line": fl.line,
+                                "reason": fl.reason,
+                            }
+                            for fl in postflight.flags
+                        ],
+                    },
+                )
+                yield _sse_bytes("done", {})
+                return
+
             yield _sse_bytes(
                 "step",
                 {
