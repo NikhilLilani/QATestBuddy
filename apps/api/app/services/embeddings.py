@@ -67,10 +67,16 @@ async def embed_texts(texts: Iterable[str]) -> list[list[float]]:
 
 
 async def embed_query(query: str) -> list[float]:
-    """Embed a single search query. Applies BGE's query-side instruction."""
+    """Embed a single search query. Applies BGE's query-side instruction.
+
+    Raises ValueError on empty input rather than returning a zero vector —
+    a zero vector silently produces NaN cosine distances and poisons any
+    table it lands in. Callers should short-circuit empty queries before
+    reaching this function.
+    """
     q = (query or "").strip()
     if not q:
-        return [0.0] * DIM
+        raise ValueError("embed_query called with empty input")
     model = await _get_model()
     text = _QUERY_INSTRUCTION + q
 

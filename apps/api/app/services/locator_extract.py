@@ -377,15 +377,16 @@ async def find_locator(
     if not q:
         return []
     args: list = [workspace_id, q, max(1, min(k, 50))]
+    # Compute placeholder indices dynamically — hard-coding $4/$5 broke when
+    # `kinds` was supplied without `repo_id` (kinds bound to $4 instead of $5).
     repo_clause = ""
     if repo_id:
-        repo_clause = "and f.repo_id = $4::uuid"
         args.append(repo_id)
+        repo_clause = f"and f.repo_id = ${len(args)}::uuid"
     kind_clause = ""
     if kinds:
-        kind_list = list(kinds)
-        kind_clause = f"and l.selector_kind = any($5)"
-        args.append(kind_list)
+        args.append(list(kinds))
+        kind_clause = f"and l.selector_kind = any(${len(args)})"
 
     rows = await fetch(
         f"""

@@ -35,15 +35,9 @@ from app.core.crypto import decrypt, encrypt, hint
 from app.db.queries import execute, fetch, fetchrow, get_pool
 from app.services.embeddings import embed_texts, to_pgvector_literal
 from app.services.github_repo import parse_github_url
-from app.services.locator_extract import (
-    delete_locators_for_repo,
-    index_locators_for_file,
-)
+from app.services.locator_extract import index_locators_for_file
 from app.services.rag_ingest import chunk_text
-from app.services.route_extract import (
-    delete_routes_for_repo,
-    index_routes_for_file,
-)
+from app.services.route_extract import index_routes_for_file
 
 log = logging.getLogger("qatb.devrepo")
 
@@ -83,6 +77,29 @@ _SKIP_FILENAMES = {
 _MAX_FILE_BYTES = 200_000           # 200 KB
 _MAX_FILES_PER_REPO = 500
 _MAX_REPO_TOTAL_BYTES = 50_000_000  # 50 MB — guardrail against accidental monorepo dumps
+
+# Patterns that look like PATs / secrets. httpx error reprs occasionally include
+# Authorization headers or URLs with embedded credentials; we redact before
+# anything goes into the (workspace-readable) `last_error` column.
+_SECRET_PATTERNS = [
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgho_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bghu_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bghs_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"(?i)\b(?:authorization|bearer|token)\b\s*[:=]\s*\S+"),
+    # `https://user:secret@host/...` form sometimes shown by httpx tracebacks.
+    re.compile(r"://[^/\s]+:[^/\s@]+@"),
+]
+
+
+def _scrub_secrets(s: str) -> str:
+    """Redact anything that looks like a PAT/credential. Used before writing
+    error strings to a workspace-readable column."""
+    out = s
+    for pat in _SECRET_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    return out
 
 
 @dataclass
@@ -256,9 +273,12 @@ async def ingest_repo(workspace_id: str, repo_id: str) -> IngestedRepo:
             raise ValueError(f"unsupported source_kind {repo['source_kind']}")
     except Exception as e:  # noqa: BLE001
         log.exception("dev-repo fetch failed")
+        # Scrub PATs from the error message before persisting — last_error is
+        # readable by anyone in the workspace via list_repos.
+        safe_msg = _scrub_secrets(f"fetch failed: {type(e).__name__}: {e}")[:500]
         await execute(
             "update public.repos set last_error = $1 where id = $2::uuid",
-            f"fetch failed: {type(e).__name__}: {e}"[:500], repo_id,
+            safe_msg, repo_id,
         )
         raise
 
@@ -268,22 +288,25 @@ async def ingest_repo(workspace_id: str, repo_id: str) -> IngestedRepo:
     total_bytes = 0
     file_payloads: list[tuple[str, str, str]] = []  # (file_id, path, content) for post-tx extraction
 
-    # Wipe extracted artifacts up-front. We do this OUTSIDE the chunk
-    # transaction because locator_index / dev_repo_routes are populated
-    # after the transaction commits (they reference repo_files.id, which
-    # need to be visible before we can insert pointing to them).
-    await delete_locators_for_repo(workspace_id, repo_id)
-    await delete_routes_for_repo(workspace_id, repo_id)
-
+    # NOTE on stale-artifact wiping:
+    # locator_index rows reference repo_files.id ON DELETE CASCADE, so the
+    # `delete from repo_files` below atomically clears them along with the
+    # chunks. dev_repo_routes references repo_id (not repo_files) so we wipe
+    # those explicitly inside the same transaction below — keeps everything
+    # consistent if the transaction rolls back.
     pool = await get_pool()
     async with pool.acquire() as conn, conn.transaction():
-        # Wipe stale chunks for files we're about to re-ingest. We delete
-        # by repo, which is simple and matches the user's mental model:
-        # "I clicked re-index, start fresh." Per-file diffing is an
-        # optimisation we can add later if indexing becomes slow.
+        # Wipe stale chunks + routes for files we're about to re-ingest.
+        # locator_index rows cascade automatically when repo_files is deleted
+        # (FK ON DELETE CASCADE). Routes reference repo_id directly, so do
+        # them here inside the same transaction to keep consistency on rollback.
         await conn.execute(
             "delete from public.repo_chunks "
             "where repo_file_id in (select id from public.repo_files where repo_id = $1::uuid)",
+            repo_id,
+        )
+        await conn.execute(
+            "delete from public.dev_repo_routes where repo_id = $1::uuid",
             repo_id,
         )
         await conn.execute(
@@ -292,7 +315,9 @@ async def ingest_repo(workspace_id: str, repo_id: str) -> IngestedRepo:
         )
 
         for path, content in files:
-            if len(files) and indexed >= _MAX_FILES_PER_REPO:
+            # _MAX_FILES_PER_REPO cap — the github fetcher already trims to
+            # this, but the zip path doesn't, so enforce again here.
+            if indexed >= _MAX_FILES_PER_REPO:
                 skipped += 1
                 continue
             if total_bytes + len(content) > _MAX_REPO_TOTAL_BYTES:
@@ -498,6 +523,18 @@ def _fetch_zip_files(zip_storage_key: str | None) -> list[tuple[str, str]]:
             # Strip the top-level folder GitHub zips include
             # ("owner-repo-sha1/..." → "...") so paths look natural.
             rel = re.sub(r"^[^/]+/", "", info.filename)
+            # Reject path-traversal in the archive entries. We never write
+            # files to disk, but `rel` is persisted in repo_files.path and
+            # echoed back in citation links / the locator UI; a malicious
+            # zip with "../etc/passwd" entries would otherwise show up as
+            # confusing citations and could poison logs.
+            norm = rel.replace("\\", "/")
+            if (
+                norm.startswith("/")
+                or any(seg in ("..",) for seg in norm.split("/"))
+            ):
+                continue
+            rel = norm
             if not _should_index(rel, info.file_size):
                 continue
             try:
