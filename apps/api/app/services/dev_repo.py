@@ -457,15 +457,29 @@ async def _fetch_github_files(
 
         # 4. Download bodies. Public + no token → raw.githubusercontent.com is
         #    fastest. Private → use the contents API with Authorization.
+        # We aggregate fetch failures by status code so users can see e.g.
+        # "147 files skipped: 122x 404, 25x 403 — PAT may lack `repo` scope"
+        # rather than a useless "0 files indexed".
         out: list[tuple[str, str]] = []
+        fail_counts: dict[str, int] = {}
         for item in eligible:
             path = item["path"]
-            content = await _download_one(
+            content, fail_reason = await _download_one(
                 client, owner, name, effective_branch, path, pat=pat,
             )
             if content is None:
+                if fail_reason:
+                    fail_counts[fail_reason] = fail_counts.get(fail_reason, 0) + 1
                 continue
             out.append((path, content))
+        if fail_counts:
+            summary = ", ".join(f"{n}x {reason}" for reason, n in sorted(fail_counts.items()))
+            log.warning(
+                "dev-repo %s/%s: %d files fetched, %d skipped (%s). "
+                "If you used a PAT, check it has the `repo` scope; if public, "
+                "the file may exceed GitHub's 1 MB raw limit.",
+                owner, name, len(out), sum(fail_counts.values()), summary,
+            )
         return out
 
 
@@ -477,11 +491,15 @@ async def _download_one(
     path: str,
     *,
     pat: str | None,
-) -> str | None:
-    """Fetch one file's text content. Tries raw.* first, falls back to API."""
+) -> tuple[str | None, str | None]:
+    """Fetch one file's text content. Returns (content, fail_reason).
+    On success, fail_reason is None. On failure, content is None and
+    fail_reason is a short tag like '404', '403', '413', 'network'."""
     headers: dict[str, str] = {}
     if pat:
         headers["Authorization"] = f"Bearer {pat}"
+
+    last_status: int | None = None
 
     # Public-fast path.
     if not pat:
@@ -489,9 +507,10 @@ async def _download_one(
         try:
             r = await client.get(raw_url, headers=headers)
             if r.status_code == 200 and r.text:
-                return r.text
+                return r.text, None
+            last_status = r.status_code
         except httpx.HTTPError:
-            pass
+            return None, "network"
 
     # Private or raw failed → contents API (returns base64).
     api_url = (
@@ -503,10 +522,11 @@ async def _download_one(
             api_url, headers={**headers, "Accept": "application/vnd.github.v3.raw"},
         )
         if r.status_code == 200:
-            return r.text
+            return r.text, None
+        last_status = r.status_code
     except httpx.HTTPError:
-        return None
-    return None
+        return None, "network"
+    return None, str(last_status) if last_status is not None else "unknown"
 
 
 def _fetch_zip_files(zip_storage_key: str | None) -> list[tuple[str, str]]:

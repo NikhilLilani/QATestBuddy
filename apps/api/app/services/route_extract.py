@@ -192,16 +192,19 @@ async def index_routes_for_file(
     if not records:
         return 0
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        for r in records:
-            await conn.execute(
-                """
-                insert into public.dev_repo_routes
-                    (workspace_id, repo_id, path_pattern, source_file, line, framework)
-                values ($1::uuid, $2::uuid, $3, $4, $5, $6)
-                """,
-                workspace_id, repo_id, r.path_pattern, r.source_file, r.line, r.framework,
-            )
+    async with pool.acquire() as conn, conn.transaction():
+        rows = [
+            (workspace_id, repo_id, r.path_pattern, r.source_file, r.line, r.framework)
+            for r in records
+        ]
+        await conn.executemany(
+            """
+            insert into public.dev_repo_routes
+                (workspace_id, repo_id, path_pattern, source_file, line, framework)
+            values ($1::uuid, $2::uuid, $3, $4, $5, $6)
+            """,
+            rows,
+        )
     return len(records)
 
 

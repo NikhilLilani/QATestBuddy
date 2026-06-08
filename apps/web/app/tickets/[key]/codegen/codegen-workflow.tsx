@@ -354,7 +354,7 @@ export function CodegenWorkflow({
 
       if (!planId) throw new Error('No plan returned from cases generation.');
       setActivePlanId(planId);
-      await runCodegenSSE(workspaceId, token, planId, {});
+      await runCodegenSSE(workspaceId, token, planId, {}, {});
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
@@ -362,79 +362,94 @@ export function CodegenWorkflow({
     } finally {
       setGenerating(false);
     }
+    // runCodegenSSE is declared below this callback but read at click-time
+    // via closure, so React's exhaustive-deps will warn about it. Including
+    // it here keeps the dep graph honest.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [baseUrl, flowGuidance, frameworkId, localPath, ticketKey, dataValues, dataNeeds]);
 
   // Single SSE consumer for /plans/{id}/codegen. Used both on initial run and
   // on every clarify-loop resume. Handles all 4 event kinds: step, clarify
   // (M4 — halts the stream so user can answer), result, error.
-  async function runCodegenSSE(
-    workspaceId: string,
-    token: string,
-    planId: string,
-    extraClarifications: Record<string, string>,
-  ): Promise<void> {
-    // Merge accumulated answers from prior rounds with new ones so an answer
-    // given in round 1 isn't lost if round 2 surfaces a different question.
-    const merged = { ...accumulatedClarifications, ...extraClarifications };
-    setAccumulatedClarifications(merged);
+  //
+  // useCallback ensures stable identity per render and forces every captured
+  // state value to live in the dep array — no stale-closure bugs if the user
+  // rapidly clicks Submit during a clarify round.
+  const runCodegenSSE = useCallback(
+    async (
+      workspaceId: string,
+      token: string,
+      planId: string,
+      extraClarifications: Record<string, string>,
+      priorAccumulated: Record<string, string>,
+    ): Promise<void> => {
+      // Merge accumulated answers from prior rounds with new ones so an answer
+      // given in round 1 isn't lost if round 2 surfaces a different question.
+      // We accept `priorAccumulated` as an arg (rather than reading from state)
+      // so callers can pass the exact snapshot they want to extend, avoiding
+      // a race when two rounds resolve in quick succession.
+      const merged = { ...priorAccumulated, ...extraClarifications };
+      setAccumulatedClarifications(merged);
 
-    const codegenResp = await fetch(`${API_URL}/api/v1/plans/${planId}/codegen`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Workspace-Id': workspaceId,
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-      },
-      body: JSON.stringify({
-        base_url: baseUrl.trim(),
-        framework_id: frameworkId,
-        framework_hints: flowGuidance.trim(),
-        local_path: localPath.trim(),
-        test_file_name: `${ticketKey.toLowerCase()}.spec.ts`,
-        data_values: dataValues,
-        data_needs: dataNeeds ?? [],
-        clarifications: merged,
-      }),
-    });
-    if (!codegenResp.ok || !codegenResp.body)
-      throw new Error(`Codegen failed (HTTP ${codegenResp.status}).`);
+      const codegenResp = await fetch(`${API_URL}/api/v1/plans/${planId}/codegen`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'X-Workspace-Id': workspaceId,
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        body: JSON.stringify({
+          base_url: baseUrl.trim(),
+          framework_id: frameworkId,
+          framework_hints: flowGuidance.trim(),
+          local_path: localPath.trim(),
+          test_file_name: `${ticketKey.toLowerCase()}.spec.ts`,
+          data_values: dataValues,
+          data_needs: dataNeeds ?? [],
+          clarifications: merged,
+        }),
+      });
+      if (!codegenResp.ok || !codegenResp.body)
+        throw new Error(`Codegen failed (HTTP ${codegenResp.status}).`);
 
-    for await (const ev of parseSSE(codegenResp.body)) {
-      if (ev.event === 'step') {
-        setSteps((prev) => [...prev, JSON.parse(ev.data) as StepEvent]);
-      } else if (ev.event === 'clarify') {
-        const payload = JSON.parse(ev.data) as ClarifyPayload;
-        setClarify(payload);
-        // Pre-seed the answer form with the top suggestion if there's an
-        // obvious "best guess" — easier to confirm than to type from scratch.
-        const seeds: Record<string, string> = {};
-        for (const q of payload.questions) {
-          if (q.suggested && q.suggested.length > 0) {
-            // Suggested string format: "kind=value (path:line)" — strip the
-            // file location for the field default; user can edit if needed.
-            const first = (q.suggested[0] ?? '').split(' (')[0] ?? '';
-            seeds[q.id] = first;
+      for await (const ev of parseSSE(codegenResp.body)) {
+        if (ev.event === 'step') {
+          setSteps((prev) => [...prev, JSON.parse(ev.data) as StepEvent]);
+        } else if (ev.event === 'clarify') {
+          const payload = JSON.parse(ev.data) as ClarifyPayload;
+          setClarify(payload);
+          // Pre-seed the answer form with the top suggestion if there's an
+          // obvious "best guess" — easier to confirm than to type from scratch.
+          const seeds: Record<string, string> = {};
+          for (const q of payload.questions) {
+            if (q.suggested && q.suggested.length > 0) {
+              // Suggested string format: "kind=value (path:line)" — strip the
+              // file location for the field default; user can edit if needed.
+              const first = (q.suggested[0] ?? '').split(' (')[0] ?? '';
+              seeds[q.id] = first;
+            }
           }
+          setClarifyAnswers((prev) => ({ ...seeds, ...prev }));
+          toast.info(
+            payload.stage === 'preflight'
+              ? `Need ${payload.questions.length} answer${payload.questions.length !== 1 ? 's' : ''} before generating.`
+              : `Found ${payload.questions.length} possibly-invented reference${payload.questions.length !== 1 ? 's' : ''} — please confirm.`,
+          );
+        } else if (ev.event === 'result') {
+          setCodegen(JSON.parse(ev.data) as CodegenResult);
+          setClarify(null);
+          setClarifyAnswers({});
+        } else if (ev.event === 'error') {
+          const e = JSON.parse(ev.data) as { message: string };
+          throw new Error(e.message);
+        } else if (ev.event === 'done') {
+          break;
         }
-        setClarifyAnswers((prev) => ({ ...seeds, ...prev }));
-        toast.info(
-          payload.stage === 'preflight'
-            ? `Need ${payload.questions.length} answer${payload.questions.length !== 1 ? 's' : ''} before generating.`
-            : `Found ${payload.questions.length} possibly-invented reference${payload.questions.length !== 1 ? 's' : ''} — please confirm.`,
-        );
-      } else if (ev.event === 'result') {
-        setCodegen(JSON.parse(ev.data) as CodegenResult);
-        setClarify(null);
-        setClarifyAnswers({});
-      } else if (ev.event === 'error') {
-        const e = JSON.parse(ev.data) as { message: string };
-        throw new Error(e.message);
-      } else if (ev.event === 'done') {
-        break;
       }
-    }
-  }
+    },
+    [baseUrl, frameworkId, flowGuidance, localPath, ticketKey, dataValues, dataNeeds],
+  );
 
   const submitClarify = useCallback(async () => {
     if (!clarify || !activePlanId) return;
@@ -460,7 +475,15 @@ export function CodegenWorkflow({
       const wsList = (await wsResp.json()) as { id: string }[];
       const workspaceId = wsList[0]?.id;
       if (!workspaceId) throw new Error('No workspace.');
-      await runCodegenSSE(workspaceId, token, activePlanId, clarifyAnswers);
+      // Snapshot the current accumulated map and pass it explicitly so
+      // runCodegenSSE doesn't depend on the latest setState in this render.
+      await runCodegenSSE(
+        workspaceId,
+        token,
+        activePlanId,
+        clarifyAnswers,
+        accumulatedClarifications,
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
@@ -468,11 +491,7 @@ export function CodegenWorkflow({
     } finally {
       setGenerating(false);
     }
-    // runCodegenSSE captures component state via closure, so we don't need it
-    // in deps; including it would trigger needless re-creations of the
-    // callback on every keystroke.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clarify, clarifyAnswers, activePlanId]);
+  }, [clarify, clarifyAnswers, activePlanId, accumulatedClarifications, runCodegenSSE]);
 
   const canGenerate =
     !!frameworkId &&

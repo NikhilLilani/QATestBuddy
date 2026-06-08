@@ -304,23 +304,35 @@ async def index_locators_for_file(
     """Extract and store locators for one file. Returns count inserted.
 
     Caller is responsible for having already deleted prior rows for this
-    file (done at the repo level inside ingest_repo's transaction)."""
+    file (done at the repo level inside ingest_repo's transaction).
+
+    All inserts for a single file run inside one transaction to amortize
+    pooler round-trips. A 500-file repo with ~20 locators per file would
+    otherwise issue 10k serial INSERTs."""
     records = extract_locators(path, content)
     if not records:
         return 0
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        for r in records:
-            await conn.execute(
-                """
-                insert into public.locator_index
-                    (workspace_id, repo_file_id, line, selector_kind,
-                     selector_value, component, label, context)
-                values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb)
-                """,
+    async with pool.acquire() as conn, conn.transaction():
+        # Pre-marshal the rows so executemany sends one packet rather than N.
+        # asyncpg's executemany is much faster than a Python loop of execute()
+        # because each call would otherwise hit the pooler separately.
+        rows = [
+            (
                 workspace_id, repo_file_id, r.line, r.selector_kind,
                 r.selector_value, r.component, r.label, r.context,
             )
+            for r in records
+        ]
+        await conn.executemany(
+            """
+            insert into public.locator_index
+                (workspace_id, repo_file_id, line, selector_kind,
+                 selector_value, component, label, context)
+            values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb)
+            """,
+            rows,
+        )
     return len(records)
 
 
