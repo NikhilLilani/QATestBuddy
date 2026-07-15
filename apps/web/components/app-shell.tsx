@@ -15,6 +15,8 @@ import {
   KeyRound,
   TerminalSquare,
   User as UserIcon,
+  Sparkles,
+  Bug,
 } from 'lucide-react';
 
 export interface AppShellProps {
@@ -90,6 +92,11 @@ export function AppShell({
               icon={<Ticket className="h-4 w-4" />}
             />
             <SidebarLink
+              href="/automation/new"
+              label="Direct automation"
+              icon={<Sparkles className="h-4 w-4" />}
+            />
+            <SidebarLink
               href="/plans"
               label="Plans"
               icon={<ClipboardList className="h-4 w-4" />}
@@ -98,6 +105,11 @@ export function AppShell({
               href="/runs"
               label="Runs"
               icon={<PlayCircle className="h-4 w-4" />}
+            />
+            <SidebarLink
+              href="/bugs"
+              label="Bugs"
+              icon={<Bug className="h-4 w-4" />}
             />
           </NavSection>
 

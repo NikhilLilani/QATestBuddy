@@ -5,9 +5,10 @@ import { bootstrapWorkspace, getCurrentWorkspace } from '@/lib/workspace';
 import { apiFetch, ApiError } from '@/lib/api';
 import { AppShell } from '@/components/app-shell';
 import { Alert } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
 import { StatusBadge } from '@/components/ui/status-dot';
 import { ExpandableText } from '@/components/expandable-text';
-import { ExternalLink, FileText } from 'lucide-react';
+import { Bug, ExternalLink, FileText } from 'lucide-react';
 import { PlanWorkflow } from './plan-workflow';
 
 type Ticket = {
@@ -66,15 +67,23 @@ export default async function TicketPage({ params }: { params: Promise<{ key: st
       }
       actions={
         ticket && (
-          <a
-            href={ticket.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 rounded-md border border-[hsl(var(--border))] px-3 py-1.5 text-sm font-medium hover:bg-[hsl(var(--muted))]"
-          >
-            <span className="font-mono text-xs">{ticket.key}</span>
-            <ExternalLink className="h-3.5 w-3.5" />
-          </a>
+          <div className="flex items-center gap-2">
+            <Link href={`/tickets/${ticket.key}/bugs`}>
+              <Button size="sm" variant="secondary">
+                <Bug className="mr-1.5 h-3.5 w-3.5" />
+                Find bugs
+              </Button>
+            </Link>
+            <a
+              href={ticket.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 rounded-md border border-[hsl(var(--border))] px-3 py-1.5 text-sm font-medium hover:bg-[hsl(var(--muted))]"
+            >
+              <span className="font-mono text-xs">{ticket.key}</span>
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          </div>
         )
       }
     >

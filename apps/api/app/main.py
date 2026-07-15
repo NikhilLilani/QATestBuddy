@@ -12,6 +12,7 @@ from app.routers import (
     api_keys,
     bridge,
     bridge_runner,
+    bugs,
     dev_repos,
     frameworks,
     health,
@@ -61,3 +62,4 @@ app.include_router(rag.router, prefix="/api/v1")
 app.include_router(dev_repos.router, prefix="/api/v1")
 app.include_router(project_state.router, prefix="/api/v1")
 app.include_router(runs_live.router, prefix="/api/v1")
+app.include_router(bugs.router, prefix="/api/v1")
