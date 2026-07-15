@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@qa/web", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "api",
+      "runtimeExecutable": "D:\\QAtestbuddy\\.claude\\run-api.bat",
+      "runtimeArgs": [],
+      "port": 8000
+    }
+  ]
+}
