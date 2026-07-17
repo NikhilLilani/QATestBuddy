@@ -83,7 +83,7 @@ class GroundedReference:
 @dataclass
 class PreflightResult:
     grounded: list[GroundedReference]
-    clarify: list[ClarifyQuestion]
+    unresolved: list[ClarifyQuestion]
     prompt_block: str
     intents_total: int
     intents_resolved: int
@@ -232,41 +232,29 @@ async def preflight_grounding(
     workspace_id: str,
     cases: list[TestCase],
     dev_repo_id: str | None = None,
-    user_clarifications: dict[str, str] | None = None,
 ) -> PreflightResult:
-    """Resolve every detected UI intent to a real locator/route, or emit a
-    clarify question. If the workspace has no indexed dev repo at all, we
-    skip the whole pass — there's nothing to ground against and forcing
-    clarifies would be obnoxious. The contract activates the moment a repo
-    is indexed.
+    """Resolve every detected UI intent to a real locator/route where
+    possible. If the workspace has no indexed dev repo at all, we skip the
+    whole pass — there's nothing to ground against. Anything that doesn't
+    resolve against an indexed repo is returned as `unresolved`; the caller
+    folds those into the prompt as a best-effort instruction (see
+    `format_unresolved_prompt_block`) rather than blocking on them — the
+    contract activates the moment a repo is indexed, but never halts codegen.
     """
     if not await _workspace_has_indexed_repo(workspace_id):
         log.info(
             "preflight grounding skipped — no indexed dev repo for workspace %s",
             workspace_id,
         )
-        return PreflightResult(grounded=[], clarify=[], prompt_block="",
+        return PreflightResult(grounded=[], unresolved=[], prompt_block="",
                                intents_total=0, intents_resolved=0)
 
     intents = extract_intents(cases)
     grounded: list[GroundedReference] = []
-    clarify: list[ClarifyQuestion] = []
-    clarifications = user_clarifications or {}
+    unresolved: list[ClarifyQuestion] = []
 
     for kind, intent in intents:
         qid = _quick_id(kind, intent)
-
-        # If the user already answered this clarify question on a prior turn,
-        # promote their answer to a grounded reference and move on.
-        if qid in clarifications and clarifications[qid].strip():
-            answer = clarifications[qid].strip()
-            grounded.append(GroundedReference(
-                intent=intent,
-                kind=kind,
-                value=answer,
-                source_file="(user-supplied)",
-            ))
-            continue
 
         if kind == "locator":
             hit = await _resolve_locator(
@@ -283,18 +271,17 @@ async def preflight_grounding(
                     component=hit.component,
                 ))
             else:
-                # Build a short list of "almost matches" so the user has
-                # something to copy-paste in their answer.
+                # Build a short list of "almost matches" — surfaced to the
+                # model as candidates it can use for its best-effort guess.
                 near = await find_locator(
                     workspace_id=workspace_id, intent=intent, k=3, repo_id=dev_repo_id,
                 )
-                clarify.append(ClarifyQuestion(
+                unresolved.append(ClarifyQuestion(
                     id=qid,
                     label=f"Stable selector for '{intent}'",
                     reason=(
-                        f"I couldn't find a confident selector match for "
-                        f"'{intent}' in your indexed dev repo. Provide a "
-                        f"data-testid, role+name, or any selector you trust."
+                        f"No confident selector match for '{intent}' in the "
+                        f"indexed dev repo."
                     ),
                     kind="selector",
                     intent=intent,
@@ -315,13 +302,11 @@ async def preflight_grounding(
                     source_line=hit.line,
                 ))
             else:
-                clarify.append(ClarifyQuestion(
+                unresolved.append(ClarifyQuestion(
                     id=qid,
                     label=f"URL for '{intent}'",
                     reason=(
-                        f"I couldn't find a route matching '{intent}' in your "
-                        f"indexed dev repo. Provide the actual path the test "
-                        f"should visit (e.g. /auth/sign-in)."
+                        f"No route matching '{intent}' in the indexed dev repo."
                     ),
                     kind="route",
                     intent=intent,
@@ -330,11 +315,33 @@ async def preflight_grounding(
 
     return PreflightResult(
         grounded=grounded,
-        clarify=clarify,
+        unresolved=unresolved,
         prompt_block=_format_prompt_block(grounded),
         intents_total=len(intents),
         intents_resolved=len(grounded),
     )
+
+
+def format_unresolved_prompt_block(unresolved: list[ClarifyQuestion]) -> str:
+    """Best-effort instruction block for intents that didn't resolve against
+    the indexed repo. Rather than blocking on a clarify question, we tell the
+    model to write its best guess AND flag it inline so a human can spot and
+    verify it later."""
+    if not unresolved:
+        return ""
+    lines: list[str] = [
+        "=== UNRESOLVED REFERENCES (best effort — do not skip) ===\n"
+        "No confident match was found in the indexed repo for these. Write "
+        "your best working guess for each AND add an inline comment directly "
+        "above the line that uses it:\n"
+        "  // UNVERIFIED: <intent> — not found in indexed repo, confirm before relying on this\n"
+        "Still write complete, runnable code — do not omit the step."
+    ]
+    for q in unresolved:
+        near = f"  (candidates: {', '.join(q.suggested)})" if q.suggested else ""
+        lines.append(f"  • '{q.intent}' (kind: {q.kind}){near}")
+    lines.append("=== end unresolved references ===")
+    return "\n".join(lines)
 
 
 def _format_prompt_block(grounded: list[GroundedReference]) -> str:
@@ -407,7 +414,7 @@ class PostflightFlag:
 @dataclass
 class PostflightResult:
     flags: list[PostflightFlag]
-    clarify: list[ClarifyQuestion]
+    unresolved: list[ClarifyQuestion]
 
 
 async def postflight_scan(
@@ -423,7 +430,7 @@ async def postflight_scan(
     locator_index/dev_repo_routes for this workspace becomes a flag.
     """
     if not await _workspace_has_indexed_repo(workspace_id):
-        return PostflightResult(flags=[], clarify=[])
+        return PostflightResult(flags=[], unresolved=[])
 
     flags: list[PostflightFlag] = []
     for f in files:
@@ -473,16 +480,18 @@ async def postflight_scan(
                 ),
             ))
 
-    # Convert flags into clarify questions. We dedupe by (kind, value) so the
-    # same invented selector across 10 files yields ONE question.
+    # Convert flags into informational items. We dedupe by (kind, value) so
+    # the same invented selector across 10 files yields ONE entry. These are
+    # surfaced to the user as warnings alongside the completed bundle, not as
+    # a blocking question — the code was already generated.
     seen: set[tuple[str, str]] = set()
-    clarify: list[ClarifyQuestion] = []
+    unresolved: list[ClarifyQuestion] = []
     for fl in flags:
         key = (fl.kind, fl.value)
         if key in seen:
             continue
         seen.add(key)
-        clarify.append(ClarifyQuestion(
+        unresolved.append(ClarifyQuestion(
             id=_quick_id(f"post.{fl.kind}", fl.value),
             label=(
                 f"Verify selector '{fl.value}'"
@@ -492,10 +501,5 @@ async def postflight_scan(
             reason=fl.reason + f"  (first occurrence: {fl.file}:{fl.line})",
             kind=fl.kind,
             intent=fl.value,
-            placeholder=(
-                "Provide the real selector, or confirm with 'ok' to accept."
-                if fl.kind == "selector"
-                else "Provide the real route, or confirm with 'ok' to accept."
-            ),
         ))
-    return PostflightResult(flags=flags, clarify=clarify)
+    return PostflightResult(flags=flags, unresolved=unresolved)

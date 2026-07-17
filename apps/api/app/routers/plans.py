@@ -205,7 +205,11 @@ async def list_plans(ws: CurrentWorkspace, limit: int = 50) -> list[dict]:
 
 @router.get("/runs")
 async def list_runs(ws: CurrentWorkspace, limit: int = 50) -> list[dict]:
-    """All codegen runs in the workspace, newest first. Soft-deleted runs hidden."""
+    """Codegen runs in the workspace, newest first. Soft-deleted runs hidden.
+
+    Scoped to playwright_local/playwright_cloud — BugHunter's 'static'/'live'
+    runs have no generated_tests bundle and live on their own /bugs page.
+    """
     rows = await fetch(
         """
         select r.id::text                              as id,
@@ -221,6 +225,7 @@ async def list_runs(ws: CurrentWorkspace, limit: int = 50) -> list[dict]:
         left join public.tickets t on t.id = r.ticket_id
         where r.workspace_id = $1
           and r.deleted_at is null
+          and r.kind in ('playwright_local', 'playwright_cloud')
         order by r.created_at desc
         limit $2
         """,
@@ -946,10 +951,6 @@ class CodegenRequest(BaseModel):
     # When set, find_locator/find_route are scoped to this repo only —
     # multi-app workspaces don't bleed selectors across products.
     dev_repo_id: str | None = None
-    # M4: user answers to a prior clarify SSE event. The key is the
-    # ClarifyQuestion.id; the value is whatever the user typed. The codegen
-    # request resumes with these answers folded into the grounded set.
-    clarifications: dict[str, str] = Field(default_factory=dict)
     # M5: project state branching. If omitted we auto-detect via
     # /project-state/detect (same heuristics). Pass a value to override.
     project_state: str | None = None
@@ -1149,17 +1150,22 @@ async def create_codegen(
     async def stream() -> AsyncIterator[bytes]:
         try:
             # Stage 0 — pre-flight grounding (M4)
-            # If the workspace has an indexed dev repo, every UI intent in
-            # the cases must resolve to a real locator/route or the user has
-            # to clarify. Returns immediately with an empty grounded block
-            # when no dev repo is indexed.
-            from app.agents.grounding import postflight_scan, preflight_grounding
+            # If the workspace has an indexed dev repo, resolve every UI
+            # intent in the cases to a real locator/route. Returns an empty
+            # grounded block when no dev repo is indexed. Anything that
+            # doesn't resolve is NOT blocking — it's folded into the prompt
+            # as a best-effort instruction (guess it, flag it inline) so
+            # generation always completes.
+            from app.agents.grounding import (
+                format_unresolved_prompt_block,
+                postflight_scan,
+                preflight_grounding,
+            )
             yield _sse_bytes("step", {"name": "grounding", "status": "start"})
             preflight = await preflight_grounding(
                 workspace_id=workspace_id,
                 cases=cases,
                 dev_repo_id=body.dev_repo_id,
-                user_clarifications=body.clarifications,
             )
             yield _sse_bytes(
                 "step",
@@ -1168,49 +1174,18 @@ async def create_codegen(
                     "status": "done",
                     "intents_total": preflight.intents_total,
                     "intents_resolved": preflight.intents_resolved,
-                    "clarify_count": len(preflight.clarify),
+                    "unresolved_count": len(preflight.unresolved),
                 },
             )
 
-            # If anything is unresolved, halt and ask the user. The frontend
-            # collects the answers and re-POSTs with `clarifications` filled
-            # in; this same stream restarts from Stage 0 and the answered
-            # questions are now treated as canonical grounded refs.
-            if preflight.clarify:
-                yield _sse_bytes(
-                    "clarify",
-                    {
-                        "stage": "preflight",
-                        "questions": [
-                            {
-                                "id": q.id,
-                                "label": q.label,
-                                "reason": q.reason,
-                                "kind": q.kind,
-                                "intent": q.intent,
-                                "placeholder": q.placeholder,
-                                "suggested": q.suggested,
-                            }
-                            for q in preflight.clarify
-                        ],
-                        "resolved": [
-                            {
-                                "intent": g.intent,
-                                "kind": g.kind,
-                                "value": g.value,
-                                "selector_kind": g.selector_kind,
-                                "source_file": g.source_file,
-                                "source_line": g.source_line,
-                            }
-                            for g in preflight.grounded
-                        ],
-                    },
+            # Grounded refs are canonical; unresolved ones become a
+            # best-effort instruction appended to the same prompt block.
+            grounded_block = preflight.prompt_block
+            if preflight.unresolved:
+                grounded_block = "\n\n".join(
+                    part for part in (grounded_block, format_unresolved_prompt_block(preflight.unresolved)) if part
                 )
-                yield _sse_bytes("done", {})
-                return
-
-            # All intents resolved — inject the grounded block into the prompt.
-            inp.grounded_block = preflight.prompt_block
+            inp.grounded_block = grounded_block
 
             # Stage 1 — codegen
             yield _sse_bytes(
@@ -1221,8 +1196,9 @@ async def create_codegen(
             total_lines = sum(f.content.count("\n") + 1 for f in envelope.data.files)
 
             # Stage 1.5 — post-flight scan (M4). Catches anything the model
-            # invented in spite of the grounded block. Only blocks when we
-            # have something to check against (i.e. an indexed dev repo).
+            # invented in spite of the grounded block. Only has something to
+            # check against when a dev repo is indexed. No longer blocking —
+            # anything flagged becomes a warning note on the completed bundle.
             postflight = await postflight_scan(
                 workspace_id=workspace_id,
                 files=envelope.data.files,
@@ -1234,37 +1210,19 @@ async def create_codegen(
                 },
                 dev_repo_id=body.dev_repo_id,
             )
-            if postflight.clarify:
-                yield _sse_bytes(
-                    "clarify",
-                    {
-                        "stage": "postflight",
-                        "questions": [
-                            {
-                                "id": q.id,
-                                "label": q.label,
-                                "reason": q.reason,
-                                "kind": q.kind,
-                                "intent": q.intent,
-                                "placeholder": q.placeholder,
-                                "suggested": q.suggested,
-                            }
-                            for q in postflight.clarify
-                        ],
-                        "flags": [
-                            {
-                                "kind": fl.kind,
-                                "value": fl.value,
-                                "file": fl.file,
-                                "line": fl.line,
-                                "reason": fl.reason,
-                            }
-                            for fl in postflight.flags
-                        ],
-                    },
-                )
-                yield _sse_bytes("done", {})
-                return
+            if postflight.unresolved:
+                for q in postflight.unresolved:
+                    envelope.data.notes.append(
+                        f"⚠ Unverified {q.kind} '{q.intent}' — {q.reason}"
+                    )
+            yield _sse_bytes(
+                "step",
+                {
+                    "name": "postflight",
+                    "status": "done",
+                    "unresolved_count": len(postflight.unresolved),
+                },
+            )
 
             yield _sse_bytes(
                 "step",
