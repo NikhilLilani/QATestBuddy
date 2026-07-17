@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { cn } from '@/lib/utils';
 import { brand } from '@qa/brand';
 import { signOut } from '@/app/(auth)/actions';
 import { Button } from '@/components/ui/button';
@@ -30,6 +31,10 @@ export interface AppShellProps {
   actions?: React.ReactNode;
   /** Sub-description under the title */
   subtitle?: string;
+  /** Page content uses the full viewport width instead of a centered
+   * max-w-6xl column. Defaults to true; pass `false` to opt a page back
+   * into the narrower centered layout (e.g. a form-heavy page). */
+  fullWidth?: boolean;
   children: React.ReactNode;
 }
 
@@ -40,6 +45,7 @@ export function AppShell({
   title,
   subtitle,
   actions,
+  fullWidth = true,
   children,
 }: AppShellProps) {
   return (
@@ -47,8 +53,8 @@ export function AppShell({
       {/* ──────────── Sidebar ──────────── */}
       <aside className="sticky top-0 hidden h-screen w-64 shrink-0 flex-col border-r bg-white md:flex">
         <div className="flex h-16 items-center gap-2 border-b px-5">
-          <Link href="/dashboard" className="flex items-baseline gap-2">
-            <span className="text-lg font-semibold tracking-tight">{brand.name}</span>
+          <Link href="/dashboard" className="flex items-center gap-2">
+            <img src={brand.logo.light} alt={brand.name} className="h-7 w-auto" />
             <span className="rounded bg-brand/10 px-1.5 py-0.5 text-[10px] font-mono uppercase text-brand-700">
               beta
             </span>
@@ -175,8 +181,8 @@ export function AppShell({
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Mobile top bar (sidebar is hidden) */}
         <div className="flex h-14 items-center justify-between border-b bg-white px-4 md:hidden">
-          <Link href="/dashboard" className="text-base font-semibold">
-            {brand.name}
+          <Link href="/dashboard">
+            <img src={brand.logo.light} alt={brand.name} className="h-6 w-auto" />
           </Link>
           <form action={signOut}>
             <Button type="submit" variant="ghost" size="sm">
@@ -188,7 +194,7 @@ export function AppShell({
         {/* Page header */}
         {(breadcrumb || title || actions) && (
           <header className="border-b bg-white">
-            <div className="mx-auto max-w-6xl px-6 py-5">
+            <div className={cn('mx-auto px-6 py-5', fullWidth ? 'max-w-none' : 'max-w-6xl')}>
               {breadcrumb && breadcrumb.length > 0 && (
                 <nav className="mb-2 flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))]">
                   {breadcrumb.map((seg, i) => (
@@ -226,7 +232,9 @@ export function AppShell({
 
         {/* Page body */}
         <main className="flex-1">
-          <div className="mx-auto max-w-6xl px-6 py-6">{children}</div>
+          <div className={cn('mx-auto px-6 py-6', fullWidth ? 'max-w-none' : 'max-w-6xl')}>
+            {children}
+          </div>
         </main>
       </div>
     </div>

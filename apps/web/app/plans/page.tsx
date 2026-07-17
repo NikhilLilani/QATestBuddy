@@ -36,6 +36,7 @@ export default async function PlansHistoryPage() {
       breadcrumb={['Plans']}
       title="Plans history"
       subtitle="Every test plan you've generated. Tick rows to bulk-delete; click Open to reopen the ticket."
+      fullWidth
       actions={
         <Link href="/tickets">
           <Button>

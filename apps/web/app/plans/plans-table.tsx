@@ -103,91 +103,93 @@ export function PlansTable({ plans }: { plans: PlanRow[] }) {
         </div>
       )}
 
-      <div className="overflow-x-auto">
-        <table className="min-w-full text-sm">
-          <thead className="bg-[hsl(var(--muted))]/40 text-left text-[11px] uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
-            <tr>
-              <th className="w-10 px-3 py-2">
-                <Checkbox
-                  checked={allChecked}
-                  indeterminate={someChecked}
-                  onChange={toggleAll}
-                  aria-label="Select all plans"
-                />
-              </th>
-              <th className="px-3 py-2">Ticket</th>
-              <th className="px-3 py-2">Title</th>
-              <th className="px-3 py-2">Cases</th>
-              <th className="px-3 py-2">Runs</th>
-              <th className="px-3 py-2">Tokens</th>
-              <th className="px-3 py-2">Created</th>
-              <th className="px-3 py-2"></th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {plans.map((p) => {
-              const isSel = selected.has(p.id);
-              return (
-                <tr
-                  key={p.id}
-                  className={
-                    isSel
-                      ? 'bg-brand/5 hover:bg-brand/10'
-                      : 'hover:bg-[hsl(var(--muted))]/30'
-                  }
-                >
-                  <td className="px-3 py-2">
-                    <Checkbox
-                      checked={isSel}
-                      onChange={() => toggleOne(p.id)}
-                      aria-label={`Select ${p.jira_key}`}
-                    />
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs">{p.jira_key}</td>
-                  <td className="px-3 py-2">
-                    <div className="max-w-md truncate">{p.title}</div>
-                    {p.status && <StatusBadge tone="gray">{p.status}</StatusBadge>}
-                  </td>
-                  <td className="px-3 py-2 text-xs">
-                    <StatusBadge tone="sky">{p.case_count}</StatusBadge>
-                  </td>
-                  <td className="px-3 py-2 text-xs">
-                    {p.run_count > 0 ? (
-                      <StatusBadge tone="green">{p.run_count}</StatusBadge>
-                    ) : (
-                      <span className="text-[hsl(var(--muted-foreground))]">—</span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 text-xs text-[hsl(var(--muted-foreground))]">
-                    {p.tokens_in} / {p.tokens_out}
-                  </td>
-                  <td className="px-3 py-2 text-xs text-[hsl(var(--muted-foreground))]">
-                    {formatDate(p.created_at)}
-                  </td>
-                  <td className="px-3 py-2">
-                    <div className="flex items-center gap-1">
-                      <Link href={`/tickets/${p.jira_key}`}>
-                        <Button size="sm" variant="secondary">
-                          Open
-                        </Button>
-                      </Link>
-                      <Link href={`/tickets/${p.jira_key}/codegen`}>
-                        <Button size="sm">Codegen</Button>
-                      </Link>
-                      <DeleteButton
-                        iconOnly
-                        id={p.id}
-                        action={deletePlanAction}
-                        confirmLabel={`Delete plan for ${p.jira_key}?`}
-                        successMessage={`Deleted plan for ${p.jira_key}.`}
+      <div className="overflow-hidden rounded-md border">
+        <div className="max-h-[70vh] overflow-x-auto overflow-y-auto">
+          <table className="min-w-full text-base">
+            <thead className="sticky top-0 z-10 bg-[hsl(var(--muted))]/95 text-left text-xs font-semibold uppercase tracking-wider text-[hsl(var(--muted-foreground))] backdrop-blur">
+              <tr>
+                <th className="w-10 px-4 py-3">
+                  <Checkbox
+                    checked={allChecked}
+                    indeterminate={someChecked}
+                    onChange={toggleAll}
+                    aria-label="Select all plans"
+                  />
+                </th>
+                <th className="px-4 py-3">Ticket</th>
+                <th className="px-4 py-3">Title</th>
+                <th className="px-4 py-3">Cases</th>
+                <th className="px-4 py-3">Runs</th>
+                <th className="px-4 py-3">Tokens</th>
+                <th className="px-4 py-3">Created</th>
+                <th className="px-4 py-3"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {plans.map((p) => {
+                const isSel = selected.has(p.id);
+                return (
+                  <tr
+                    key={p.id}
+                    className={
+                      isSel
+                        ? 'bg-brand/5 hover:bg-brand/10'
+                        : 'hover:bg-[hsl(var(--muted))]/30'
+                    }
+                  >
+                    <td className="px-4 py-3 align-middle">
+                      <Checkbox
+                        checked={isSel}
+                        onChange={() => toggleOne(p.id)}
+                        aria-label={`Select ${p.jira_key}`}
                       />
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                    </td>
+                    <td className="px-4 py-3 align-middle font-mono text-sm">{p.jira_key}</td>
+                    <td className="px-4 py-3 align-middle">
+                      <div className="max-w-md truncate text-[15px] font-semibold">{p.title}</div>
+                      {p.status && <StatusBadge tone="gray">{p.status}</StatusBadge>}
+                    </td>
+                    <td className="px-4 py-3 align-middle text-sm">
+                      <StatusBadge tone="sky">{p.case_count}</StatusBadge>
+                    </td>
+                    <td className="px-4 py-3 align-middle text-sm">
+                      {p.run_count > 0 ? (
+                        <StatusBadge tone="green">{p.run_count}</StatusBadge>
+                      ) : (
+                        <span className="text-[hsl(var(--muted-foreground))]">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 align-middle text-sm text-[hsl(var(--muted-foreground))]">
+                      {p.tokens_in} / {p.tokens_out}
+                    </td>
+                    <td className="px-4 py-3 align-middle text-sm text-[hsl(var(--muted-foreground))]">
+                      {formatDate(p.created_at)}
+                    </td>
+                    <td className="px-4 py-3 align-middle">
+                      <div className="flex flex-wrap items-center justify-end gap-1.5">
+                        <Link href={`/tickets/${p.jira_key}`}>
+                          <Button size="sm" variant="secondary">
+                            Open
+                          </Button>
+                        </Link>
+                        <Link href={`/tickets/${p.jira_key}/codegen`}>
+                          <Button size="sm">Codegen</Button>
+                        </Link>
+                        <DeleteButton
+                          iconOnly
+                          id={p.id}
+                          action={deletePlanAction}
+                          confirmLabel={`Delete plan for ${p.jira_key}?`}
+                          successMessage={`Deleted plan for ${p.jira_key}.`}
+                        />
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );

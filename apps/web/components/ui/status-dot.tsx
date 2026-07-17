@@ -35,10 +35,12 @@ export function StatusBadge({
   tone = 'gray',
   children,
   icon,
+  title,
 }: {
   tone?: Tone;
   children: React.ReactNode;
   icon?: React.ReactNode;
+  title?: string;
 }) {
   const ring: Record<Tone, string> = {
     green: 'border-emerald-200 bg-emerald-50 text-emerald-800',
@@ -49,6 +51,7 @@ export function StatusBadge({
   };
   return (
     <span
+      title={title}
       className={cn(
         'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium',
         ring[tone],

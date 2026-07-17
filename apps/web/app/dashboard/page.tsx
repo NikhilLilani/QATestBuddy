@@ -195,21 +195,21 @@ export default async function DashboardPage() {
               ) : (
                 <ul className="divide-y text-sm">
                   {recentPlans.map((p) => (
-                    <li key={p.id} className="group flex items-center justify-between gap-2 py-2.5">
+                    <li key={p.id} className="group flex items-center justify-between gap-3 py-3">
                       <Link
                         href={`/tickets/${p.jira_key}`}
                         className="min-w-0 flex-1 truncate"
                       >
                         <div className="flex items-center gap-2">
-                          <span className="rounded bg-[hsl(var(--muted))] px-1.5 py-0.5 font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
+                          <span className="rounded bg-[hsl(var(--muted))] px-1.5 py-0.5 font-mono text-xs text-[hsl(var(--muted-foreground))]">
                             {p.jira_key}
                           </span>
-                          <span className="truncate text-sm group-hover:text-brand-700 group-hover:underline">
+                          <span className="truncate text-[15px] font-medium group-hover:text-brand-700 group-hover:underline">
                             {p.title}
                           </span>
                         </div>
                       </Link>
-                      <span className="shrink-0 text-[11px] text-[hsl(var(--muted-foreground))]">
+                      <span className="shrink-0 text-xs text-[hsl(var(--muted-foreground))]">
                         {p.case_count} cases · {formatRelative(p.created_at)}
                       </span>
                     </li>
@@ -245,21 +245,21 @@ export default async function DashboardPage() {
               ) : (
                 <ul className="divide-y text-sm">
                   {recentRuns.map((r) => (
-                    <li key={r.id} className="group flex items-center justify-between gap-2 py-2.5">
+                    <li key={r.id} className="group flex items-center justify-between gap-3 py-3">
                       <Link
                         href={r.jira_key ? `/tickets/${r.jira_key}/codegen` : '/runs'}
                         className="min-w-0 flex-1 truncate"
                       >
                         <div className="flex items-center gap-2">
-                          <span className="rounded bg-[hsl(var(--muted))] px-1.5 py-0.5 font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
+                          <span className="rounded bg-[hsl(var(--muted))] px-1.5 py-0.5 font-mono text-xs text-[hsl(var(--muted-foreground))]">
                             {r.jira_key ?? 'run'}
                           </span>
-                          <span className="truncate text-sm group-hover:text-brand-700 group-hover:underline">
+                          <span className="truncate text-[15px] font-medium group-hover:text-brand-700 group-hover:underline">
                             {r.title ?? r.kind}
                           </span>
                         </div>
                       </Link>
-                      <span className="shrink-0 text-[11px] text-[hsl(var(--muted-foreground))]">
+                      <span className="shrink-0 text-xs text-[hsl(var(--muted-foreground))]">
                         {r.file_count} files · {formatRelative(r.created_at)}
                       </span>
                     </li>
