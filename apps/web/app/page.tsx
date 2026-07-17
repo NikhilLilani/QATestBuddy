@@ -5,8 +5,8 @@ export default function LandingPage() {
   return (
     <main className="min-h-screen">
       <header className="container flex items-center justify-between py-6">
-        <Link href="/" className="text-xl font-semibold">
-          {brand.name}
+        <Link href="/">
+          <img src={brand.logo.light} alt={brand.name} className="h-8 w-auto" />
         </Link>
         <nav className="flex items-center gap-4 text-sm">
           <Link href="#how" className="hover:underline">

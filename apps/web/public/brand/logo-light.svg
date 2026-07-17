@@ -1,0 +1,11 @@
+<svg width="180" height="40" viewBox="0 0 180 40" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="qatbGradLight" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#0284C7"/>
+    </linearGradient>
+  </defs>
+  <rect width="40" height="40" rx="10" fill="url(#qatbGradLight)"/>
+  <path d="M12 21.5 L17.5 27 L28.5 14" stroke="white" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <text x="50" y="27" font-family="Segoe UI, Arial, sans-serif" font-weight="700" font-size="20" fill="#0F172A">QAtestbuddy</text>
+</svg>
